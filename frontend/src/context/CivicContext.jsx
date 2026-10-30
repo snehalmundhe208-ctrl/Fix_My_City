@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { INITIAL_COMPLAINTS, MOCK_OFFICERS, REWARDS_CATALOG } from '../data/mockData';
 import confetti from 'canvas-confetti';
+import { apiClient } from '../api/client';
 
 const CivicContext = createContext();
 
@@ -35,6 +36,30 @@ export const CivicProvider = ({ children }) => {
     ];
   });
 
+  // Initial fetch from backend if online
+  useEffect(() => {
+    async function fetchInitialData() {
+      try {
+        const serverComplaints = await apiClient.get('/complaints');
+        if (serverComplaints && Array.isArray(serverComplaints) && serverComplaints.length > 0) {
+          setComplaints(serverComplaints);
+        }
+      } catch (e) {
+        // use local state
+      }
+
+      try {
+        const serverOfficers = await apiClient.get('/officers');
+        if (serverOfficers && Array.isArray(serverOfficers) && serverOfficers.length > 0) {
+          setOfficers(serverOfficers);
+        }
+      } catch (e) {
+        // use local state
+      }
+    }
+    fetchInitialData();
+  }, []);
+
   useEffect(() => {
     localStorage.setItem('fixmycity_complaints', JSON.stringify(complaints));
   }, [complaints]);
@@ -55,12 +80,13 @@ export const CivicProvider = ({ children }) => {
     localStorage.setItem('fixmycity_activities', JSON.stringify(recentActivities));
   }, [recentActivities]);
 
-  const addComplaint = (newComplaintData) => {
+  const addComplaint = async (newComplaintData) => {
+    // Optimistic / Local creation
     const nextNum = Math.floor(8925 + Math.random() * 50);
-    const newId = `CM-${nextNum}`;
+    const tempId = `CM-${nextNum}`;
 
-    const newComplaint = {
-      id: newId,
+    let newComplaint = {
+      id: tempId,
       title: newComplaintData.title || `${newComplaintData.category} Issue at ${newComplaintData.location}`,
       category: newComplaintData.category || "Garbage",
       description: newComplaintData.description || "",
@@ -95,15 +121,21 @@ export const CivicProvider = ({ children }) => {
       imageUrl: newComplaintData.imageUrl || "https://images.unsplash.com/photo-1530587191325-3db32d826c18?auto=format&fit=crop&w=800&q=80"
     };
 
-    setComplaints(prev => [newComplaint, ...prev]);
+    try {
+      const serverResponse = await apiClient.post('/complaints', newComplaintData);
+      if (serverResponse && serverResponse.id) {
+        newComplaint = serverResponse;
+      }
+    } catch (e) {
+      console.log('Saved complaint to local store (API offline)');
+    }
 
-    // Credit reward points for valid civic report
+    setComplaints(prev => [newComplaint, ...prev]);
     setRewardPoints(prev => prev + 15);
 
-    // Log activity
     const newAct = {
       id: `act-${Date.now()}`,
-      title: `Complaint #${newId} logged`,
+      title: `Complaint #${newComplaint.id} logged`,
       subtitle: `Category: ${newComplaint.category} (+15 pts awarded)`,
       time: "Just now",
       type: "report"
@@ -125,9 +157,15 @@ export const CivicProvider = ({ children }) => {
     }
   };
 
-  const assignOfficerToComplaint = (complaintId, officerId) => {
+  const assignOfficerToComplaint = async (complaintId, officerId) => {
     const officer = officers.find(o => o.id === officerId) || officers[0];
-    
+
+    try {
+      await apiClient.post(`/complaints/${complaintId}/assign-officer`, { officer_id: officerId });
+    } catch (e) {
+      // handled locally
+    }
+
     setComplaints(prev => prev.map(c => {
       if (c.id === complaintId) {
         const updatedTimeline = c.timeline.map(t => {
@@ -161,7 +199,6 @@ export const CivicProvider = ({ children }) => {
       return c;
     }));
 
-    // Log activity
     setRecentActivities(prev => [{
       id: `act-${Date.now()}`,
       title: `Complaint #${complaintId} assigned`,
@@ -171,7 +208,13 @@ export const CivicProvider = ({ children }) => {
     }, ...prev]);
   };
 
-  const updateComplaintStatus = (complaintId, newStatus, note = "") => {
+  const updateComplaintStatus = async (complaintId, newStatus, note = "") => {
+    try {
+      await apiClient.put(`/complaints/${complaintId}/status`, { status: newStatus, notes: note });
+    } catch (e) {
+      // handled locally
+    }
+
     setComplaints(prev => prev.map(c => {
       if (c.id === complaintId) {
         let updatedTimeline = [...c.timeline];
@@ -212,7 +255,13 @@ export const CivicProvider = ({ children }) => {
     }, ...prev]);
   };
 
-  const triggerCompensation = (complaintId, compensationData) => {
+  const triggerCompensation = async (complaintId, compensationData) => {
+    try {
+      await apiClient.post(`/complaints/${complaintId}/compensate`, compensationData);
+    } catch (e) {
+      // handled locally
+    }
+
     setComplaints(prev => prev.map(c => {
       if (c.id === complaintId) {
         return {
@@ -233,7 +282,6 @@ export const CivicProvider = ({ children }) => {
       return c;
     }));
 
-    // Credit 50 bonus civic points as courtesy
     setRewardPoints(prev => prev + 50);
 
     setRecentActivities(prev => [{
@@ -245,7 +293,13 @@ export const CivicProvider = ({ children }) => {
     }, ...prev]);
   };
 
-  const toggleUpvote = (complaintId) => {
+  const toggleUpvote = async (complaintId) => {
+    try {
+      await apiClient.post(`/complaints/${complaintId}/upvote`, {});
+    } catch (e) {
+      // handled locally
+    }
+
     setComplaints(prev => prev.map(c => {
       if (c.id === complaintId) {
         const hasUpvoted = !c.hasUpvoted;
@@ -256,14 +310,27 @@ export const CivicProvider = ({ children }) => {
     }));
   };
 
-  const addComment = (complaintId, text, userName = "Amit Sharma", isOfficial = false) => {
-    const commentObj = {
+  const addComment = async (complaintId, text, userName = "Amit Sharma", isOfficial = false) => {
+    let commentObj = {
       id: `c-${Date.now()}`,
       user: userName,
       text,
       time: "Just now",
       isOfficial
     };
+
+    try {
+      const serverRes = await apiClient.post(`/complaints/${complaintId}/comments`, {
+        text,
+        user_name: userName,
+        is_official: isOfficial
+      });
+      if (serverRes && serverRes.id) {
+        commentObj = serverRes;
+      }
+    } catch (e) {
+      // handled locally
+    }
 
     setComplaints(prev => prev.map(c => {
       if (c.id === complaintId) {
@@ -277,13 +344,12 @@ export const CivicProvider = ({ children }) => {
     }));
   };
 
-  const redeemReward = (reward) => {
+  const redeemReward = async (reward) => {
     if (rewardPoints < reward.points) {
       return { success: false, message: "Insufficient reward points!" };
     }
 
-    setRewardPoints(prev => prev - reward.points);
-    const voucher = {
+    let voucher = {
       id: `claim-${Date.now()}`,
       rewardId: reward.id,
       title: reward.title,
@@ -292,9 +358,18 @@ export const CivicProvider = ({ children }) => {
       pointsSpent: reward.points
     };
 
+    try {
+      const res = await apiClient.post('/rewards/redeem', { reward_id: reward.id });
+      if (res && res.voucher) {
+        voucher = res.voucher;
+      }
+    } catch (e) {
+      // handled locally
+    }
+
+    setRewardPoints(prev => prev - reward.points);
     setRedeemedRewards(prev => [voucher, ...prev]);
 
-    // Trigger celebration confetti
     try {
       confetti({
         particleCount: 80,

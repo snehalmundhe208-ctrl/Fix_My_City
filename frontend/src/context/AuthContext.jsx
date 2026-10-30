@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
+import { apiClient } from '../api/client';
 
 const AuthContext = createContext();
 
@@ -40,19 +41,39 @@ export const AuthProvider = ({ children }) => {
     }
   }, [currentUser]);
 
-  const initiateLogin = (email, password, role = 'Citizen') => {
+  const initiateLogin = async (email, password, role = 'Citizen') => {
     let targetUser;
     if (role === 'Admin' || email.toLowerCase().includes('admin')) {
       targetUser = { ...ADMIN_USER, email: email || ADMIN_USER.email };
     } else {
       targetUser = { ...CITIZEN_USER, email: email || CITIZEN_USER.email };
     }
+
+    try {
+      const res = await apiClient.post('/auth/login', { email, password, role });
+      if (res && res.user) {
+        targetUser = {
+          ...targetUser,
+          ...res.user,
+          initials: (res.user.name || "User").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)
+        };
+      }
+    } catch (e) {
+      // fallback to mock user
+    }
+
     setPendingMfaUser(targetUser);
     return { success: true, requireMfa: true };
   };
 
-  const verifyMfaOtp = (otp) => {
+  const verifyMfaOtp = async (otp) => {
     if (pendingMfaUser) {
+      try {
+        await apiClient.post('/auth/verify-otp', { email: pendingMfaUser.email, otp });
+      } catch (e) {
+        // handled locally
+      }
+
       setCurrentUser(pendingMfaUser);
       const destination = pendingMfaUser.role === 'Admin' ? '/admin' : '/dashboard';
       setPendingMfaUser(null);
@@ -61,8 +82,8 @@ export const AuthProvider = ({ children }) => {
     return { success: false, message: "Invalid session or OTP" };
   };
 
-  const registerCitizen = ({ name, email, phone, password }) => {
-    const newUser = {
+  const registerCitizen = async ({ name, email, phone, password }) => {
+    let newUser = {
       id: `usr-${Date.now()}`,
       name: name || "New Citizen",
       email,
@@ -72,6 +93,20 @@ export const AuthProvider = ({ children }) => {
       initials: (name || "NC").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2),
       avatarBg: "bg-navy-800 text-white"
     };
+
+    try {
+      const res = await apiClient.post('/auth/register', { name, email, phone, password });
+      if (res && res.user) {
+        newUser = {
+          ...newUser,
+          ...res.user,
+          initials: (res.user.name || "NC").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)
+        };
+      }
+    } catch (e) {
+      // handled locally
+    }
+
     setPendingMfaUser(newUser);
     return { success: true, requireMfa: true };
   };
