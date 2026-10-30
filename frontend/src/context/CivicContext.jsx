@@ -122,7 +122,25 @@ export const CivicProvider = ({ children }) => {
     };
 
     try {
-      const serverResponse = await apiClient.post('/complaints', newComplaintData);
+      let serverResponse;
+      if (newComplaintData.file) {
+        const formData = new FormData();
+        formData.append('category', newComplaintData.category || 'Roads');
+        formData.append('description', newComplaintData.description || '');
+        formData.append('location', newComplaintData.location || 'Central Ward');
+        formData.append('ward', newComplaintData.ward || 'Ward 12');
+        formData.append('contact', newComplaintData.contact || '+91 98220 12345');
+        formData.append('urgency', newComplaintData.urgency || 'Medium');
+        if (newComplaintData.title) formData.append('title', newComplaintData.title);
+        if (newComplaintData.citizenName) formData.append('citizenName', newComplaintData.citizenName);
+        if (newComplaintData.citizenEmail) formData.append('citizenEmail', newComplaintData.citizenEmail);
+        formData.append('file', newComplaintData.file);
+
+        serverResponse = await apiClient.post('/complaints', formData, true);
+      } else {
+        serverResponse = await apiClient.post('/complaints', newComplaintData);
+      }
+
       if (serverResponse && serverResponse.id) {
         newComplaint = serverResponse;
       }

@@ -12,10 +12,17 @@ export const RegisterPage = () => {
   const [password, setPassword] = useState('');
   const [ward, setWard] = useState('Ward 12');
 
-  const handleSubmit = (e) => {
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    registerCitizen({ name, email, phone, password });
-    navigate('/mfa');
+    setError('');
+    try {
+      await registerCitizen({ name, email, phone, password, ward });
+      navigate('/mfa');
+    } catch (err) {
+      setError(err.message || 'Registration failed');
+    }
   };
 
   return (
@@ -66,6 +73,12 @@ export const RegisterPage = () => {
               Join thousands of residents improving their city infrastructure
             </p>
           </div>
+
+          {error && (
+            <div className="mb-4 p-3 rounded-lg bg-red-50 text-red-700 text-xs font-semibold border border-red-200">
+              {error}
+            </div>
+          )}
 
           <form onSubmit={handleSubmit} className="space-y-3.5">
             <div>

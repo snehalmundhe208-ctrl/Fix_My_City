@@ -6,10 +6,21 @@ import { useAuth } from '../context/AuthContext';
 export const MfaPage = () => {
   const navigate = useNavigate();
   const { pendingMfaUser, verifyMfaOtp } = useAuth();
-  const [otp, setOtp] = useState(['4', '8', '2', '9', '1', '0']); // prefilled convenient demo OTP
-  const [timeLeft, setTimeLeft] = useState(167); // 02:47
+  const [otp, setOtp] = useState(() => {
+    if (pendingMfaUser?.demoOtp && pendingMfaUser.demoOtp.length === 6) {
+      return pendingMfaUser.demoOtp.split('');
+    }
+    return ['4', '8', '2', '9', '1', '0'];
+  });
+  const [timeLeft, setTimeLeft] = useState(180); // 3-minute statutory expiry
   const [error, setError] = useState('');
   const inputRefs = useRef([]);
+
+  useEffect(() => {
+    if (pendingMfaUser?.demoOtp && pendingMfaUser.demoOtp.length === 6) {
+      setOtp(pendingMfaUser.demoOtp.split(''));
+    }
+  }, [pendingMfaUser]);
 
   useEffect(() => {
     if (timeLeft <= 0) return;
@@ -44,12 +55,12 @@ export const MfaPage = () => {
   };
 
   const handleResend = () => {
-    setTimeLeft(179);
+    setTimeLeft(180);
     setError('');
     alert("New 6-digit verification code sent to your registered contact channel.");
   };
 
-  const handleVerify = (e) => {
+  const handleVerify = async (e) => {
     e.preventDefault();
     const code = otp.join('');
     if (code.length < 6) {
@@ -57,7 +68,12 @@ export const MfaPage = () => {
       return;
     }
 
-    const result = verifyMfaOtp(code);
+    if (timeLeft <= 0) {
+      setError('Verification code has expired (3 minutes limit). Please request a new code.');
+      return;
+    }
+
+    const result = await verifyMfaOtp(code);
     if (result.success) {
       navigate(result.destination);
     } else {

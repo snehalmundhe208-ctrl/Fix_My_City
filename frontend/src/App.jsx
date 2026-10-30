@@ -3,6 +3,7 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import { TopBar } from './components/layout/TopBar';
 import { Header } from './components/layout/Header';
 import { Footer } from './components/layout/Footer';
+import { BackendOfflineBanner } from './components/common/BackendOfflineBanner';
 
 // Pages
 import { LandingPage } from './pages/LandingPage';
@@ -26,6 +27,9 @@ function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8F9FB] text-gray-900 font-sans selection:bg-amber-100 selection:text-navy-900">
+      {/* Real backend connectivity warning banner */}
+      <BackendOfflineBanner />
+
       {/* 1. Top Utility Bar */}
       <TopBar />
 

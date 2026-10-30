@@ -74,12 +74,13 @@ export const ReportIssuePage = () => {
       setUploadedFile({
         name: file.name,
         size: `${(file.size / 1024).toFixed(1)} KB`,
-        previewUrl: URL.createObjectURL(file)
+        previewUrl: URL.createObjectURL(file),
+        rawFile: file
       });
     }
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if (!description.trim()) {
       alert("Please provide an issue description.");
@@ -87,8 +88,8 @@ export const ReportIssuePage = () => {
     }
 
     setIsSubmitting(true);
-    setTimeout(() => {
-      const created = addComplaint({
+    try {
+      const created = await addComplaint({
         title: title || `${category} issue at ${location || ward}`,
         category,
         description,
@@ -98,12 +99,16 @@ export const ReportIssuePage = () => {
         urgency,
         citizenName: currentUser?.name || "Amit Sharma",
         citizenEmail: currentUser?.email || "amit.sharma@example.com",
-        imageUrl: uploadedFile?.previewUrl || undefined
+        imageUrl: uploadedFile?.previewUrl || undefined,
+        file: uploadedFile?.rawFile || undefined
       });
 
       setIsSubmitting(false);
       navigate(`/track?id=${created.id}&new=true`);
-    }, 600);
+    } catch (err) {
+      setIsSubmitting(false);
+      alert(`Submission error: ${err.message}`);
+    }
   };
 
   return (

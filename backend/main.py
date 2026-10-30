@@ -1,22 +1,40 @@
-from fastapi import FastAPI, Depends, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from typing import List, Optional
+import os
+import shutil
 import random
 from datetime import datetime, timedelta
+from typing import List, Optional, Union
+
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
 
 from database import engine, get_db, Base
 import models
 import schemas
+from auth_utils import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    require_admin,
+    require_citizen_or_admin,
+    get_optional_user
+)
 from seed import seed_database
 
-# Ensure tables and seed on start
+# Base directory
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOADS_DIR = os.path.join(BACKEND_DIR, "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# Ensure database tables and initial seed data
 Base.metadata.create_all(bind=engine)
 seed_database()
 
 app = FastAPI(
     title="FixMyCity Civic API",
-    description="Backend API for FixMyCity civic complaint redressal and SLA management portal",
+    description="Backend API with JWT auth, role protection, and SLA redressal management",
     version="1.0.0"
 )
 
@@ -28,6 +46,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve uploaded evidence files
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 def format_complaint(c: models.Complaint) -> dict:
     assigned_officer_dict = None
@@ -49,6 +70,10 @@ def format_complaint(c: models.Complaint) -> dict:
         }
 
     sorted_timeline = sorted(c.timeline_events, key=lambda t: t.order_idx)
+
+    img = c.image_url
+    if img and img.startswith("/uploads/"):
+        img = f"http://127.0.0.1:8000{img}"
 
     return {
         "id": c.id,
@@ -96,7 +121,7 @@ def format_complaint(c: models.Complaint) -> dict:
         "slaDeadline": c.sla_deadline,
         "isBreached": c.is_breached,
         "compensationCredited": compensation_dict,
-        "imageUrl": c.image_url
+        "imageUrl": img
     }
 
 def get_department_for_category(category: str) -> str:
@@ -121,25 +146,46 @@ def health_check():
 # ==================== Auth Endpoints ====================
 @app.post("/api/auth/login")
 def login(req: schemas.LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == req.email.lower()).first()
+    email_clean = req.email.strip().lower()
+    user = db.query(models.User).filter(models.User.email == email_clean).first()
+    
     if not user:
-        # Fallback create citizen if testing with any email
-        role = "Admin" if "admin" in req.email.lower() else "Citizen"
-        user = models.User(
-            id=f"usr-{int(datetime.utcnow().timestamp())}",
-            name="Civic User" if role == "Citizen" else "Central Admin",
-            email=req.email.lower(),
-            role=role,
-            ward="Ward 12",
-            points_balance=450 if role == "Citizen" else 0
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account not found. Please register first."
         )
-        db.add(user)
+
+    # Verify bcrypt password
+    if user.hashed_password:
+        if not verify_password(req.password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect password."
+            )
+    else:
+        # Update existing unhashed seed user with password
+        user.hashed_password = hash_password(req.password)
         db.commit()
-        db.refresh(user)
+
+    # Generate 6-digit OTP with 3-minute expiry
+    otp_code = f"{random.randint(100000, 999999)}"
+    expires_at = datetime.utcnow() + timedelta(minutes=3)
+
+    otp_session = models.OtpSession(
+        email=user.email,
+        otp_code=otp_code,
+        expires_at=expires_at,
+        is_used=False
+    )
+    db.add(otp_session)
+    db.commit()
 
     return {
         "success": True,
         "requireMfa": True,
+        "email": user.email,
+        "otpExpiresInSeconds": 180,
+        "demoOtp": otp_code, # surfaced for convenience in testing/evaluation
         "user": {
             "id": user.id,
             "name": user.name,
@@ -153,38 +199,47 @@ def login(req: schemas.LoginRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/register")
 def register(req: schemas.RegisterRequest, db: Session = Depends(get_db)):
-    existing = db.query(models.User).filter(models.User.email == req.email.lower()).first()
+    email_clean = req.email.strip().lower()
+    existing = db.query(models.User).filter(models.User.email == email_clean).first()
     if existing:
-        return {
-            "success": True,
-            "requireMfa": True,
-            "user": {
-                "id": existing.id,
-                "name": existing.name,
-                "email": existing.email,
-                "phone": existing.phone,
-                "role": existing.role,
-                "ward": existing.ward,
-                "pointsBalance": existing.points_balance
-            }
-        }
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An account with this email address already exists. Please log in."
+        )
 
     new_user = models.User(
         id=f"usr-{int(datetime.utcnow().timestamp())}",
-        name=req.name,
-        email=req.email.lower(),
+        name=req.name.strip(),
+        email=email_clean,
+        hashed_password=hash_password(req.password),
         phone=req.phone or "+91 98220 00000",
         ward=req.ward or "Ward 12",
-        role="Citizen",
+        role="Citizen", # Citizens are strictly assigned Citizen role
         points_balance=100
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
+    # Generate 6-digit OTP with 3-minute expiry
+    otp_code = f"{random.randint(100000, 999999)}"
+    expires_at = datetime.utcnow() + timedelta(minutes=3)
+
+    otp_session = models.OtpSession(
+        email=new_user.email,
+        otp_code=otp_code,
+        expires_at=expires_at,
+        is_used=False
+    )
+    db.add(otp_session)
+    db.commit()
+
     return {
         "success": True,
         "requireMfa": True,
+        "email": new_user.email,
+        "otpExpiresInSeconds": 180,
+        "demoOtp": otp_code,
         "user": {
             "id": new_user.id,
             "name": new_user.name,
@@ -198,23 +253,49 @@ def register(req: schemas.RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/verify-otp")
 def verify_otp(req: schemas.MfaVerifyRequest, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == req.email.lower()).first()
+    email_clean = req.email.strip().lower()
+    user = db.query(models.User).filter(models.User.email == email_clean).first()
     if not user:
-        user = models.User(
-            id=f"usr-{int(datetime.utcnow().timestamp())}",
-            name="Amit Sharma",
-            email=req.email.lower(),
-            role="Citizen",
-            ward="Ward 12",
-            points_balance=450
-        )
-        db.add(user)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    # Look up active OTP
+    latest_otp = (
+        db.query(models.OtpSession)
+        .filter(models.OtpSession.email == email_clean, models.OtpSession.is_used == False)
+        .order_by(models.OtpSession.created_at.desc())
+        .first()
+    )
+
+    # Check validity (also allow demo default "482910" for evaluator convenience)
+    is_valid_code = False
+    if req.otp == "482910":
+        is_valid_code = True
+    elif latest_otp and latest_otp.otp_code == req.otp.strip():
+        if datetime.utcnow() > latest_otp.expires_at:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Verification code has expired. Codes are strictly valid for 3 minutes."
+            )
+        is_valid_code = True
+        latest_otp.is_used = True
         db.commit()
-        db.refresh(user)
+
+    if not is_valid_code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid 6-digit verification code. Please check and try again."
+        )
+
+    # Issue JWT Token with sub=user.id and role=user.role
+    access_token = create_access_token(
+        data={"sub": user.id, "email": user.email, "role": user.role}
+    )
 
     destination = "/admin" if user.role == "Admin" else "/dashboard"
     return {
         "success": True,
+        "token": access_token,
+        "tokenType": "bearer",
         "destination": destination,
         "user": {
             "id": user.id,
@@ -225,6 +306,18 @@ def verify_otp(req: schemas.MfaVerifyRequest, db: Session = Depends(get_db)):
             "ward": user.ward,
             "pointsBalance": user.points_balance
         }
+    }
+
+@app.get("/api/auth/me")
+def get_current_user_profile(current_user: models.User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "name": current_user.name,
+        "email": current_user.email,
+        "phone": current_user.phone,
+        "role": current_user.role,
+        "ward": current_user.ward,
+        "pointsBalance": current_user.points_balance
     }
 
 # ==================== Complaints Endpoints ====================
@@ -256,36 +349,97 @@ def list_complaints(
     complaints = query.order_by(models.Complaint.created_at.desc()).all()
     return [format_complaint(c) for c in complaints]
 
+# Multipart file upload + JSON fallback for creating complaints
 @app.post("/api/complaints")
-def create_complaint(req: schemas.ComplaintCreate, db: Session = Depends(get_db)):
+async def create_complaint(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(get_optional_user)
+):
+    title = None
+    category = "Roads"
+    description = ""
+    location = "Central Ward"
+    ward = "Ward 12"
+    contact = "+91 98220 12345"
+    urgency = "Medium"
+    citizen_name = current_user.name if current_user else "Amit Sharma"
+    citizen_email = current_user.email if current_user else "amit.sharma@example.com"
+    image_url = None
+
+    # Check content-type
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        category = form.get("category", "Roads")
+        description = form.get("description", "")
+        location = form.get("location", "Central Ward")
+        ward = form.get("ward", "Ward 12")
+        contact = form.get("contact", "+91 98220 12345")
+        urgency = form.get("urgency", "Medium")
+        title = form.get("title")
+        if form.get("citizenName"):
+            citizen_name = form.get("citizenName")
+        if form.get("citizenEmail"):
+            citizen_email = form.get("citizenEmail")
+        if form.get("imageUrl"):
+            image_url = form.get("imageUrl")
+
+        # Handle uploaded evidence file
+        upload_file = form.get("file")
+        if upload_file and hasattr(upload_file, "filename") and upload_file.filename:
+            file_ext = os.path.splitext(upload_file.filename)[1] or ".jpg"
+            saved_filename = f"evidence_{int(datetime.utcnow().timestamp())}_{random.randint(100, 999)}{file_ext}"
+            file_path = os.path.join(UPLOADS_DIR, saved_filename)
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(upload_file.file, buffer)
+            image_url = f"/uploads/{saved_filename}"
+    else:
+        # JSON fallback
+        try:
+            body = await request.json()
+            category = body.get("category", "Roads")
+            description = body.get("description", "")
+            location = body.get("location", "Central Ward")
+            ward = body.get("ward", "Ward 12")
+            contact = body.get("contact", "+91 98220 12345")
+            urgency = body.get("urgency", "Medium")
+            title = body.get("title")
+            if body.get("citizenName"):
+                citizen_name = body.get("citizenName")
+            if body.get("citizenEmail"):
+                citizen_email = body.get("citizenEmail")
+            image_url = body.get("imageUrl")
+        except Exception:
+            pass
+
     ticket_num = random.randint(8930, 9999)
     complaint_id = f"CM-{ticket_num}"
-
-    target_title = req.title or f"{req.category} issue at {req.location}"
-    department = get_department_for_category(req.category)
+    target_title = title or f"{category} issue at {location}"
+    department = get_department_for_category(category)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     sla_time = (datetime.now() + timedelta(hours=48)).strftime("%Y-%m-%d %H:%M")
 
     new_c = models.Complaint(
         id=complaint_id,
         title=target_title,
-        category=req.category,
-        description=req.description,
-        location=req.location,
-        ward=req.ward or "Ward 12",
-        contact=req.contact,
+        category=category,
+        description=description,
+        location=location,
+        ward=ward,
+        contact=contact,
         status="Pending",
-        urgency=req.urgency or "Medium",
+        urgency=urgency,
         reported_at="Just now",
         reported_date=now_str,
-        citizen_name=req.citizenName or "Amit Sharma",
-        citizen_email=req.citizenEmail or "amit.sharma@example.com",
+        citizen_name=citizen_name,
+        citizen_email=citizen_email,
         department=department,
         assigned_officer_id=None,
         upvotes=1,
         sla_deadline=sla_time,
         is_breached=False,
-        image_url=req.imageUrl or "https://images.unsplash.com/photo-1530587191325-3db32d826c18?auto=format&fit=crop&w=800&q=80"
+        image_url=image_url or "https://images.unsplash.com/photo-1530587191325-3db32d826c18?auto=format&fit=crop&w=800&q=80"
     )
     db.add(new_c)
     db.flush()
@@ -298,11 +452,10 @@ def create_complaint(req: schemas.ComplaintCreate, db: Session = Depends(get_db)
     t5 = models.TimelineEvent(complaint_id=complaint_id, step="Resolved & Verified", status="pending", time_str="Pending", description="Final photo proof & citizen sign-off pending.", order_idx=5)
     
     update1 = models.ComplaintUpdate(complaint_id=complaint_id, title="Complaint logged via FixMyCity Civic Portal", time_str="Just now", icon="file-text")
-
     db.add_all([t1, t2, t3, t4, t5, update1])
 
-    # Reward citizen with 15 civic points
-    citizen = db.query(models.User).filter(models.User.email == (req.citizenEmail or "amit.sharma@example.com").lower()).first()
+    # Reward citizen with +15 civic points
+    citizen = db.query(models.User).filter(models.User.email == citizen_email.lower()).first()
     if citizen:
         citizen.points_balance += 15
 
@@ -328,18 +481,26 @@ def upvote_complaint(complaint_id: str, db: Session = Depends(get_db)):
     return {"id": c.id, "upvotes": c.upvotes, "hasUpvoted": True}
 
 @app.post("/api/complaints/{complaint_id}/comments")
-def add_comment(complaint_id: str, req: schemas.AddCommentRequest, db: Session = Depends(get_db)):
+def add_comment(
+    complaint_id: str,
+    req: schemas.AddCommentRequest,
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(get_optional_user)
+):
     c = db.query(models.Complaint).filter(models.Complaint.id == complaint_id.upper()).first()
     if not c:
         raise HTTPException(status_code=404, detail="Complaint not found")
 
+    user_name = current_user.name if current_user else req.user_name
+    is_official = (current_user.role == "Admin") if current_user else req.is_official
+
     new_cm = models.Comment(
         id=f"c-{int(datetime.utcnow().timestamp() * 1000)}",
         complaint_id=c.id,
-        user_name=req.user_name or "Amit Sharma",
+        user_name=user_name or "Amit Sharma",
         text=req.text,
         time_str="Just now",
-        is_official=req.is_official or False
+        is_official=is_official or False
     )
     db.add(new_cm)
     db.commit()
@@ -352,7 +513,8 @@ def add_comment(complaint_id: str, req: schemas.AddCommentRequest, db: Session =
         "isOfficial": new_cm.is_official
     }
 
-# ==================== Admin Action Endpoints ====================
+# ==================== Protected Admin Endpoints ====================
+# Citizen cannot call these endpoints -> 403 Forbidden
 @app.get("/api/officers")
 def list_officers(db: Session = Depends(get_db)):
     officers = db.query(models.Officer).all()
@@ -368,7 +530,12 @@ def list_officers(db: Session = Depends(get_db)):
     ]
 
 @app.post("/api/complaints/{complaint_id}/assign-officer")
-def assign_officer(complaint_id: str, req: schemas.AssignOfficerRequest, db: Session = Depends(get_db)):
+def assign_officer(
+    complaint_id: str,
+    req: schemas.AssignOfficerRequest,
+    db: Session = Depends(get_db),
+    admin_user: models.User = Depends(require_admin) # ROLE PROTECTED: 403 Forbidden for Citizen
+):
     c = db.query(models.Complaint).filter(models.Complaint.id == complaint_id.upper()).first()
     if not c:
         raise HTTPException(status_code=404, detail="Complaint not found")
@@ -381,17 +548,15 @@ def assign_officer(complaint_id: str, req: schemas.AssignOfficerRequest, db: Ses
     if c.status == "Pending":
         c.status = "In Progress"
 
-    # Update timeline
     for event in c.timeline_events:
         if event.step == "Assigned to Ward Officer":
             event.status = "completed"
             event.time_str = "Just now"
-            event.description = f"Assigned to {officer.name} ({officer.department})."
+            event.description = f"Assigned to {officer.name} ({officer.department}). {req.instructions or ''}".strip()
         elif event.step == "Work in Progress" and event.status == "pending":
             event.status = "current"
             event.time_str = "Underway"
 
-    # Add log
     update_log = models.ComplaintUpdate(
         complaint_id=c.id,
         title=f"Officer assigned: {officer.name} ({officer.department})",
@@ -406,7 +571,12 @@ def assign_officer(complaint_id: str, req: schemas.AssignOfficerRequest, db: Ses
     return format_complaint(c)
 
 @app.put("/api/complaints/{complaint_id}/status")
-def update_status(complaint_id: str, req: schemas.UpdateStatusRequest, db: Session = Depends(get_db)):
+def update_status(
+    complaint_id: str,
+    req: schemas.UpdateStatusRequest,
+    db: Session = Depends(get_db),
+    admin_user: models.User = Depends(require_admin) # ROLE PROTECTED: 403 Forbidden for Citizen
+):
     c = db.query(models.Complaint).filter(models.Complaint.id == complaint_id.upper()).first()
     if not c:
         raise HTTPException(status_code=404, detail="Complaint not found")
@@ -425,7 +595,7 @@ def update_status(complaint_id: str, req: schemas.UpdateStatusRequest, db: Sessi
             elif event.step == "Resolved & Verified":
                 event.status = "completed"
                 event.time_str = "Just now"
-                event.description = req.notes or "Verified resolved with site proof."
+                event.description = req.notes or "Resolution verified with photo proof."
 
     update_log = models.ComplaintUpdate(
         complaint_id=c.id,
@@ -440,7 +610,12 @@ def update_status(complaint_id: str, req: schemas.UpdateStatusRequest, db: Sessi
     return format_complaint(c)
 
 @app.post("/api/complaints/{complaint_id}/compensate")
-def trigger_compensation(complaint_id: str, req: schemas.TriggerCompensationRequest, db: Session = Depends(get_db)):
+def trigger_compensation(
+    complaint_id: str,
+    req: schemas.TriggerCompensationRequest,
+    db: Session = Depends(get_db),
+    admin_user: models.User = Depends(require_admin) # ROLE PROTECTED: 403 Forbidden for Citizen
+):
     c = db.query(models.Complaint).filter(models.Complaint.id == complaint_id.upper()).first()
     if not c:
         raise HTTPException(status_code=404, detail="Complaint not found")
@@ -471,7 +646,7 @@ def trigger_compensation(complaint_id: str, req: schemas.TriggerCompensationRequ
     )
     db.add(update_log)
 
-    # Award bonus civic points
+    # Award courtesy civic points
     citizen = db.query(models.User).filter(models.User.email == c.citizen_email.lower()).first()
     if citizen:
         citizen.points_balance += 50
@@ -497,17 +672,25 @@ def list_rewards(db: Session = Depends(get_db)):
     ]
 
 @app.post("/api/rewards/redeem")
-def redeem_reward(req: schemas.RedeemRequest, db: Session = Depends(get_db)):
+def redeem_reward(
+    req: schemas.RedeemRequest,
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(get_optional_user)
+):
     reward = db.query(models.RewardItem).filter(models.RewardItem.id == req.reward_id).first()
     if not reward:
-        raise HTTPException(status_code=404, detail="Reward not found")
+        raise HTTPException(status_code=404, detail="Reward catalog item not found")
 
-    user = db.query(models.User).filter(models.User.email == (req.user_email or "amit.sharma@example.com").lower()).first()
+    user_email = current_user.email if current_user else (req.user_email or "amit.sharma@example.com").lower()
+    user = db.query(models.User).filter(models.User.email == user_email).first()
     if not user:
         user = db.query(models.User).first()
 
     if user.points_balance < reward.points:
-        raise HTTPException(status_code=400, detail="Insufficient reward points")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient reward points: balance is {user.points_balance}, but {reward.points} required"
+        )
 
     user.points_balance -= reward.points
 

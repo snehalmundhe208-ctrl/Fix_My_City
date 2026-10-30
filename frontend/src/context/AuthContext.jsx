@@ -42,12 +42,12 @@ export const AuthProvider = ({ children }) => {
   }, [currentUser]);
 
   const initiateLogin = async (email, password, role = 'Citizen') => {
-    let targetUser;
-    if (role === 'Admin' || email.toLowerCase().includes('admin')) {
-      targetUser = { ...ADMIN_USER, email: email || ADMIN_USER.email };
-    } else {
-      targetUser = { ...CITIZEN_USER, email: email || CITIZEN_USER.email };
-    }
+    let targetUser = {
+      email,
+      role: role || (email.toLowerCase().includes('admin') ? 'Admin' : 'Citizen'),
+      name: email.toLowerCase().includes('admin') ? 'Sunil K. Verma' : 'Amit Sharma',
+      initials: email.toLowerCase().includes('admin') ? 'SV' : 'AS'
+    };
 
     try {
       const res = await apiClient.post('/auth/login', { email, password, role });
@@ -55,63 +55,93 @@ export const AuthProvider = ({ children }) => {
         targetUser = {
           ...targetUser,
           ...res.user,
-          initials: (res.user.name || "User").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)
+          initials: (res.user.name || "User").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2),
+          demoOtp: res.demoOtp
         };
       }
     } catch (e) {
-      // fallback to mock user
+      // Allow fallback only if offline mode enabled
+      if (import.meta.env.VITE_OFFLINE_MODE === 'true' || localStorage.getItem('fixmycity_dev_offline_mode') === 'true') {
+        targetUser = role === 'Admin' ? ADMIN_USER : CITIZEN_USER;
+      } else {
+        throw e;
+      }
     }
 
     setPendingMfaUser(targetUser);
-    return { success: true, requireMfa: true };
+    return { success: true, requireMfa: true, user: targetUser };
   };
 
   const verifyMfaOtp = async (otp) => {
-    if (pendingMfaUser) {
-      try {
-        await apiClient.post('/auth/verify-otp', { email: pendingMfaUser.email, otp });
-      } catch (e) {
-        // handled locally
-      }
-
-      setCurrentUser(pendingMfaUser);
-      const destination = pendingMfaUser.role === 'Admin' ? '/admin' : '/dashboard';
-      setPendingMfaUser(null);
-      return { success: true, destination };
+    if (!pendingMfaUser) {
+      return { success: false, message: "No pending login session found. Please sign in again." };
     }
-    return { success: false, message: "Invalid session or OTP" };
+
+    let verifiedUser = { ...pendingMfaUser };
+    let destination = pendingMfaUser.role === 'Admin' ? '/admin' : '/dashboard';
+
+    try {
+      const res = await apiClient.post('/auth/verify-otp', { email: pendingMfaUser.email, otp });
+      if (res && res.token) {
+        localStorage.setItem('fixmycity_token', res.token);
+      }
+      if (res && res.user) {
+        verifiedUser = {
+          ...verifiedUser,
+          ...res.user,
+          initials: (res.user.name || "User").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)
+        };
+      }
+      if (res && res.destination) {
+        destination = res.destination;
+      }
+    } catch (e) {
+      if (import.meta.env.VITE_OFFLINE_MODE === 'true' || localStorage.getItem('fixmycity_dev_offline_mode') === 'true') {
+        console.warn('Using offline MFA verification');
+      } else {
+        return { success: false, message: e.message || "Invalid or expired OTP code" };
+      }
+    }
+
+    setCurrentUser(verifiedUser);
+    setPendingMfaUser(null);
+    return { success: true, destination };
   };
 
-  const registerCitizen = async ({ name, email, phone, password }) => {
+  const registerCitizen = async ({ name, email, phone, password, ward }) => {
     let newUser = {
       id: `usr-${Date.now()}`,
       name: name || "New Citizen",
       email,
-      phone: phone || "+91 98000 00000",
+      phone: phone || "+91 98220 00000",
       role: "Citizen",
-      ward: "Ward 12",
+      ward: ward || "Ward 12",
       initials: (name || "NC").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2),
       avatarBg: "bg-navy-800 text-white"
     };
 
     try {
-      const res = await apiClient.post('/auth/register', { name, email, phone, password });
+      const res = await apiClient.post('/auth/register', { name, email, phone, password, ward });
       if (res && res.user) {
         newUser = {
           ...newUser,
           ...res.user,
-          initials: (res.user.name || "NC").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)
+          demoOtp: res.demoOtp
         };
       }
     } catch (e) {
-      // handled locally
+      if (import.meta.env.VITE_OFFLINE_MODE === 'true' || localStorage.getItem('fixmycity_dev_offline_mode') === 'true') {
+        console.warn('Using offline registration');
+      } else {
+        throw e;
+      }
     }
 
     setPendingMfaUser(newUser);
-    return { success: true, requireMfa: true };
+    return { success: true, requireMfa: true, user: newUser };
   };
 
-  const switchRole = (newRole) => {
+  const switchRole = async (newRole) => {
     if (newRole === 'Admin') {
       setCurrentUser(ADMIN_USER);
     } else {
@@ -122,6 +152,8 @@ export const AuthProvider = ({ children }) => {
   const logout = () => {
     setCurrentUser(null);
     setPendingMfaUser(null);
+    localStorage.removeItem('fixmycity_token');
+    localStorage.removeItem('fixmycity_user');
   };
 
   return (

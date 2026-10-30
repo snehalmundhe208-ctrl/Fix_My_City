@@ -1,23 +1,32 @@
 from database import SessionLocal, engine, Base
 import models
+from auth_utils import hash_password
 
 def seed_database():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
 
-    # Check if already seeded
-    if db.query(models.Complaint).first():
+    # Check if users have hashed passwords or table is empty
+    citizen_check = db.query(models.User).filter(models.User.id == "usr-citizen-1").first()
+    if citizen_check:
+        if not citizen_check.hashed_password:
+            citizen_check.hashed_password = hash_password("citizenPass123")
+            admin_check = db.query(models.User).filter(models.User.id == "usr-admin-1").first()
+            if admin_check:
+                admin_check.hashed_password = hash_password("adminSecure123")
+            db.commit()
         print("Database already seeded.")
         db.close()
         return
 
     print("Seeding database with FixMyCity initial records...")
 
-    # Users
+    # Users with Bcrypt Hashed Passwords
     citizen = models.User(
         id="usr-citizen-1",
         name="Amit Sharma",
         email="amit.sharma@example.com",
+        hashed_password=hash_password("citizenPass123"),
         phone="+91 98220 12345",
         ward="Ward 12",
         role="Citizen",
@@ -27,6 +36,7 @@ def seed_database():
         id="usr-admin-1",
         name="Sunil K. Verma",
         email="admin@fixmycity.org",
+        hashed_password=hash_password("adminSecure123"),
         phone="+91 98110 55667",
         ward="Ward 12",
         role="Admin",

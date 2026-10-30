@@ -10,15 +10,20 @@ export const LoginPage = () => {
   const [password, setPassword] = useState('password123');
   const [error, setError] = useState('');
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if (!email || !password) {
       setError('Please provide both email and password');
       return;
     }
+    setError('');
     const role = email.toLowerCase().includes('admin') ? 'Admin' : 'Citizen';
-    initiateLogin(email, password, role);
-    navigate('/mfa');
+    try {
+      await initiateLogin(email, password, role);
+      navigate('/mfa');
+    } catch (err) {
+      setError(err.message || 'Login failed. Please check credentials.');
+    }
   };
 
   const setDemoCitizen = () => {

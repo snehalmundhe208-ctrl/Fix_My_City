@@ -9,10 +9,21 @@ class User(Base):
     id = Column(String, primary_key=True, index=True)
     name = Column(String, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=True)
     phone = Column(String, nullable=True)
     ward = Column(String, default="Ward 12")
     role = Column(String, default="Citizen") # "Citizen" | "Admin"
     points_balance = Column(Integer, default=450)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class OtpSession(Base):
+    __tablename__ = "otp_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String, index=True, nullable=False)
+    otp_code = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    is_used = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Officer(Base):
